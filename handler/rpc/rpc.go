@@ -11,12 +11,15 @@ import (
 	"github.com/joncalhoun/qson"
 	"github.com/micro/go-api"
 	"github.com/micro/go-api/handler"
-	proto "github.com/micro/go-api/internal/proto"
+	"github.com/micro/go-api/internal/proto"
 	"github.com/micro/go-micro/client"
 	"github.com/micro/go-micro/errors"
 	"github.com/micro/go-micro/registry"
 	"github.com/micro/go-micro/selector"
 	"github.com/micro/util/go/lib/ctx"
+	"github.com/micro/go-log"
+	"compress/gzip"
+	"bytes"
 )
 
 const (
@@ -65,7 +68,7 @@ func (h *rpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// only allow post when we have the router
 	if r.Method != "GET" && (h.opts.Router != nil && r.Method != "POST") {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", http.StatusOK)
 		return
 	}
 
@@ -93,6 +96,11 @@ func (h *rpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		logMap := map[string]interface{}{}
+		params := make(map[string]interface{})
+		json.Unmarshal(br,&params)
+		logMap["requestParams"] = params
+
 		var request json.RawMessage
 		// if the extracted payload isn't empty lets use it
 		if len(br) > 0 {
@@ -112,7 +120,7 @@ func (h *rpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cx := ctx.FromRequest(r)
 
 		// make the call
-		if err := c.Call(cx, req, &response, client.WithSelectOption(so)); err != nil {
+		if err := c.Call(cx, req, &response, client.WithSelectOption(so),client.WithRetries(10)); err != nil {
 			ce := errors.Parse(err.Error())
 			switch ce.Code {
 			case 0:
@@ -125,11 +133,41 @@ func (h *rpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			default:
 				w.WriteHeader(int(ce.Code))
 			}
+
+			logMap["responseBody"] = ce.Error()
+			logString,_ := json.Marshal(logMap)
+			log.Logf("[%s] [%s] [%s] %s","ERROR","micro",r.URL.String(),logString)
+
+
 			w.Write([]byte(ce.Error()))
 			return
 		}
 
 		b, _ := response.MarshalJSON()
+
+		logMap["responseBody"] = response
+		var rspObj map[string]interface{}
+		json.Unmarshal(b,&rspObj)
+		level := "INFO"
+
+		if status,ok := rspObj["status"];ok {
+
+			status := status.(float64)
+
+			if status == 0 {
+				level = "NOTICE"
+			} else if status == 500 {
+				level = "ERROR"
+			}
+		}
+
+		logString,_ := json.Marshal(logMap)
+		log.Logf("[%s] [%s] [%s] %s",level,"micro",r.URL.String(),logString)
+
+		if len(b) >  100 << 10 { // > 100k zip
+			b = gzipBytes(b)
+			w.Header().Set("Content-Encoding", "gzip")
+		}
 		w.Header().Set("Content-Length", strconv.Itoa(len(b)))
 		w.Write(b)
 	case "application/proto", "application/protobuf":
@@ -180,9 +218,21 @@ func (h *rpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(b)))
 		w.Write(b)
 	default:
-		http.Error(w, "unsupported content-type", 500)
+		http.Error(w, "unsupported content-type", 200)
 		return
 	}
+}
+/**
+	gzip 处理
+*/
+func gzipBytes(b []byte) []byte {
+	var bz bytes.Buffer
+	wz := gzip.NewWriter(&bz)
+	defer wz.Close()
+	wz.Write(b)
+	wz.Flush()
+	b = bz.Bytes()
+	return b
 }
 
 func (rh *rpcHandler) String() string {
